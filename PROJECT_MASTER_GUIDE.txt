@@ -1,0 +1,862 @@
+================================================================================
+PROJECT MASTER GUIDE: AI-BASED REAL-TIME INTRUSION DETECTION SYSTEM (IDS)
+================================================================================
+
+This document contains EVERY piece of information required to recreate the entire 
+"AI Real-Time IDS" project from scratch. It includes:
+1. Complete Project Flow & Architecture Explanation
+2. Directory Structure
+3. Full Source Code for All Files
+4. Setup & Running Instructions
+
+--------------------------------------------------------------------------------
+PART 1: PROJECT FLOW & ARCHITECTURE
+--------------------------------------------------------------------------------
+
+OVERVIEW:
+This is a hybrid Intrusion Detection System (IDS) that monitors network traffic in 
+real-time. It combines Rule-Based logic (for volumetric attacks like DDos/Floods) 
+with Machine Learning (Random Forest) to detect complex anomalies.
+
+THE FLOW:
+1.  **Traffic Capture**: The system uses `scapy` (in `realtime_ids.py`) to sniff 
+    packets on the network interface (default: `en0` for Mac).
+    
+2.  **Feature Extraction**: 
+    - For every packet captured, the system extracts relevant metadata (protocol, 
+      size, flags, etc.).
+    - It constructs a feature vector compatible with the CICIDS2017 dataset 
+      (41 features) for the ML model.
+
+3.  **Hybrid Detection Engine**:
+    - **Layer 1: Rule-Based**: Checks for high-frequency requests (e.g., HTTP Flood). 
+      If requests > 20/sec, it flags an "HTTP Flood (DoS)".
+    - **Layer 2: Machine Learning**: If rule checks pass, the packet features are 
+      fed into a pre-trained Random Forest model (`rf_ids_model.pkl`). If the model 
+      predicts "attack", it flags an "ML Anomaly Pattern".
+
+4.  **Logging & State**:
+    - Attacks are logged to `attack_log.csv`.
+    - The current system state (Normal/Attack/Packet Counts) is written to 
+      `ids_state.json`.
+
+5.  **Visualization (Dashboard)**:
+    - `dashboard.py` (Streamlit) continuously reads `ids_state.json` and 
+      `attack_log.csv` to display live metrics, graphs, and alerts.
+
+6.  **Simulation**:
+    - `simulate_attack.py` generates fake traffic to test the system without 
+      waiting for a real attack.
+
+--------------------------------------------------------------------------------
+PART 2: DIRECTORY STRUCTURE
+--------------------------------------------------------------------------------
+
+AI_RealTime_IDS/
+├── dashboard.py                # The Visualization Dashboard
+├── realtime_ids.py             # The Core Detection Engine (Packet Sniffer + Logic)
+├── realtime_packet_capture.py  # Simple test script for packet capturing
+├── simulate_attack.py          # Attack Simulation Tool
+├── run_ids.sh                  # One-click startup script
+├── requirements.txt            # Python Dependencies
+├── README.md                   # Project Documentation
+├── VIVA_GUIDE.md               # Presentation/Viva Notes
+├── ids_state.json              # Shared State File (Engine -> Dashboard)
+├── attack_log.csv              # Log File (Engine -> Dashboard)
+├── data/                       # Directory for datasets
+│   └── KDDTrain+.txt           # Training Data (Optional if model exists)
+├── models/                     # Directory for saved models
+│   ├── rf_ids_model.pkl        # The Random Forest Model
+│   └── iso_forest.pkl          # Isolation Forest Model
+└── training/                   # Directory for training scripts
+    └── train_model.py          # Script to train/retrain the models
+
+--------------------------------------------------------------------------------
+PART 3: FILE CONTENTS (RECREATION DATA)
+--------------------------------------------------------------------------------
+
+Below is the exact content of every code file. To recreate the project, create 
+files with the names specified and copy the content exactly.
+
+---
+FILE 1: requirements.txt
+---
+scapy==2.6.1
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.6.0
+joblib==1.4.2
+streamlit==1.41.1
+plotly==5.24.1
+watchdog==6.0.0
+
+---
+FILE 2: run_ids.sh
+---
+#!/bin/bash
+
+echo "🚀 Starting SecureNet Hybrid AI IDS..."
+
+# Check for sudo
+if [ "$EUID" -ne 0 ]
+  then echo "❌ Please run as root (sudo ./run_ids.sh)"
+  exit
+fi
+
+# Trap Ctrl+C to kill child processes
+trap "kill 0" EXIT
+
+# Start IDS Engine in background
+echo "📡 Starting Detection Engine (realtime_ids.py)..."
+python3 realtime_ids.py &
+
+# Start Dummy HTTP Server (Victim)
+echo "🌐 Starting Victim Web Server on Port 8080..."
+python3 -m http.server 8080 > /dev/null 2>&1 &
+
+# Wait a moment for models to load
+sleep 3
+
+# Start Dashboard
+# Start Dashboard
+echo "📊 Starting Dashboard (dashboard.py)..."
+if [ -n "$SUDO_USER" ]; then
+    # Run as original user to prevent permission/MIME errors with static assets
+    sudo -u $SUDO_USER streamlit run dashboard.py &
+else
+    streamlit run dashboard.py &
+fi
+
+# Wait
+wait
+
+---
+FILE 3: realtime_ids.py
+---
+import os
+import json
+import time
+import joblib
+import numpy as np
+import pandas as pd
+from scapy.all import sniff, TCP, UDP, ICMP
+from collections import deque
+import datetime
+
+# ==========================================
+# FINAL YEAR PROJECT: AI-BASED REAL-TIME IDS
+# ==========================================
+# Author: Lakshitha Madushan
+# Component: Packet Capture & Detection Engine
+# Description: Captures live traffic, extracts features, and applies Hybrid Detection (Rules + ML).
+
+# --- CONFIGURATION ---
+MODEL_PATH = "models/rf_ids_model.pkl"
+STATE_FILE = "ids_state.json"
+LOG_FILE = "attack_log.csv"
+HTTP_FLOOD_THRESHOLD = 20  # Requests per second to trigger alert (Rule-based)
+COOLDOWN_DURATION = 3.0    # Stability mechanism to prevent alert flickering
+
+# --- GLOBAL STATE ---
+# Sliding Window for Rate Calculation
+# deque is used for O(1) appends and pops, crucial for real-time performance.
+packet_times = deque(maxlen=100)
+http_requests = deque(maxlen=200)
+
+# State management variables
+current_status = "Normal"
+last_attack_time = 0.0
+total_packets = 0
+total_attacks = 0
+
+# Load trained Machine Learning Model (Random Forest)
+try:
+    model = joblib.load(MODEL_PATH)
+    print(f"✅ [INIT] Model loaded successfully from {MODEL_PATH}")
+except Exception as e:
+    print(f"⚠️ [INIT] Error loading model: {e}")
+    model = None
+
+start_time = time.time()
+
+# 41 Features used in CICIDS2017 Dataset
+columns = [
+    "duration","protocol_type","service","flag","src_bytes","dst_bytes",
+    "land","wrong_fragment","urgent","hot","num_failed_logins","logged_in",
+    "num_compromised","root_shell","su_attempted","num_root",
+    "num_file_creations","num_shells","num_access_files","num_outbound_cmds",
+    "is_host_login","is_guest_login","count","srv_count","serror_rate",
+    "srv_serror_rate","rerror_rate","srv_rerror_rate","same_srv_rate",
+    "diff_srv_rate","srv_diff_host_rate","dst_host_count",
+    "dst_host_srv_count","dst_host_same_srv_rate","dst_host_diff_srv_rate",
+    "dst_host_same_src_port_rate","dst_host_srv_diff_host_rate",
+    "dst_host_serror_rate","dst_host_srv_serror_rate",
+    "dst_host_rerror_rate","dst_host_srv_rerror_rate"
+]
+
+def log_attack(attack_type, rate):
+    """
+    Logs detected attacks to a CSV file for auditing and dashboard visualization.
+    Format: timestamp, attack_type, rate
+    """
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Initialize file with headers if missing
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w") as f:
+            f.write("timestamp,attack_type,rate\n")
+            
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{timestamp},{attack_type},{rate:.2f}\n")
+
+def update_state_file(status, total, attacks):
+    """
+    Updates the system state JSON file atomically.
+    Atomic Write: Writes to a .tmp file first, then renames it.
+    This prevents the Dashboard from reading a corrupt/half-written file.
+    """
+    state = {
+        "total": total,
+        "attacks": attacks,
+        "status": status
+    }
+    
+    tmp_file = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp_file, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_file, STATE_FILE)
+    except Exception as e:
+        print(f"Error updating state: {e}")
+
+def extract_features(packet):
+    """
+    Extracts 41 features from a raw packet to match the Random Forest model input.
+    Note: Real-time extraction is simplified compared to offline dataset generation.
+    """
+    duration = time.time() - start_time
+    
+    # Protocol encoding: 1=TCP, 2=UDP, 3=ICMP
+    if TCP in packet:
+        protocol = 1
+    elif UDP in packet:
+        protocol = 2
+    elif ICMP in packet:
+        protocol = 3
+    else:
+        protocol = 0
+
+    src_bytes = len(packet)
+    dst_bytes = len(packet)
+
+    # Initialize feature vector
+    features = np.zeros(41)
+    features[0] = duration
+    features[1] = protocol
+    features[4] = src_bytes
+    features[5] = dst_bytes
+    features[22] = total_packets # Approximation for 'count' feature
+    features[23] = total_packets 
+
+    # Reshape for Scikit-Learn (1 row, N columns)
+    df = pd.DataFrame(features.reshape(1, -1), columns=columns)
+    return df
+
+def packet_handler(packet):
+    """
+    Main Callback Function triggered for every captured packet.
+    Implements the Hybrid Detection Logic.
+    """
+    global total_packets, total_attacks, current_status, last_attack_time
+
+    now = time.time()
+    total_packets += 1
+    packet_times.append(now)
+
+    # ---------------------------
+    # 1. TRAFFIC ANALYSIS (RULES)
+    # ---------------------------
+    is_http = False
+    if TCP in packet and packet.haslayer(TCP):
+        if packet[TCP].dport == 80 or packet[TCP].sport == 80 or packet[TCP].dport == 8080 or packet[TCP].sport == 8080:
+             is_http = True
+             http_requests.append(now)
+
+    # Rate Calculation (Packets/Sec)
+    packet_rate = 0
+    if len(packet_times) > 1:
+        duration = packet_times[-1] - packet_times[0]
+        if duration > 0:
+            packet_rate = len(packet_times) / duration
+
+    # HTTP Rate Calculation
+    http_rate = 0
+    if len(http_requests) > 1:
+        # Filter requests from last 1.0 second (Sliding Window)
+        valid_requests = [t for t in http_requests if now - t <= 1.0]
+        http_rate = len(valid_requests)
+    
+    # ---------------------------
+    # 2. DETECTION LOGIC (HYBRID)
+    # ---------------------------
+    attack_detected = False
+    attack_type = ""
+    
+    # RULE 1: Volumetric Analysis (HTTP Flood)
+    if http_rate > HTTP_FLOOD_THRESHOLD:
+        attack_detected = True
+        attack_type = "HTTP Flood (DoS)"
+        print(f"🚨 [RULE] HTTP FLOOD DETECTED! Rate: {http_rate} req/s")
+
+    # RULE 2: Machine Learning Analysis (Anomaly)
+    # Applied if no obvious accumulation rule is triggered, or in parallel
+    elif model is not None:
+        try:
+            features = extract_features(packet)
+            prediction = model.predict(features)[0]
+            if prediction == "attack": 
+                attack_detected = True
+                attack_type = "ML Anomaly Pattern"
+                print("🚨 [ML] ANOMALY DETECTED BY RANDOM FOREST")
+        except Exception:
+            pass 
+
+    # ---------------------------
+    # 3. STATE MACHINE & LOGGING
+    # ---------------------------
+    if attack_detected:
+        last_attack_time = now
+        if current_status != "ATTACK":
+            current_status = "ATTACK"
+            total_attacks += 1
+            log_attack(attack_type, max(http_rate, packet_rate))
+    
+    else:
+        # Cooldown Logic: Prevents "flickering" of status
+        if current_status == "ATTACK":
+            time_since_last = now - last_attack_time
+            if time_since_last > COOLDOWN_DURATION:
+                current_status = "Normal"
+                print("✅ [INFO] Attack subsided. System returning to Normal.")
+
+    # Optimized File I/O: Update JSON only periodically or on significant state change
+    if total_packets % 10 == 0 or attack_detected or (current_status == "Normal" and now - last_attack_time < COOLDOWN_DURATION + 1):
+        update_state_file(current_status, total_packets, total_attacks)
+
+# --- ENTRY POINT ---
+print(f"🚀 [SYSTEM START] SecureNet AI IDS Initialized...")
+print(f"ℹ️  [CONFIG] Flood Threshold: {HTTP_FLOOD_THRESHOLD} req/s")
+print("📡 Listening on interface 'en0'...")
+print("Press Ctrl+C to stop")
+
+# Reset State on Startup
+update_state_file("Normal", 0, 0)
+
+# Start Packet Sniffer (Scapy)
+sniff(
+    iface="en0",   
+    prn=packet_handler,
+    store=False
+)
+
+---
+FILE 4: dashboard.py
+---
+import streamlit as st
+import json
+import pandas as pd
+import time
+import os
+import plotly.express as px
+import plotly.graph_objects as go
+
+# -----------------------
+# PAGE CONFIGURATION
+# -----------------------
+st.set_page_config(
+    page_title="SecureNet AI | Enterprise SOC",
+    page_icon=None,
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -----------------------
+# CUSTOM CSS (ENTERPRISE SOC THEME)
+# -----------------------
+st.markdown("""
+<style>
+    /* Main Background & Font */
+    .stApp {
+        background-color: #0d1117;
+        font-family: 'SF Pro Display', sans-serif;
+    }
+    
+    /* Metrics Cards */
+    div[dataset-testid="stMetric"] {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        transition: transform 0.2s;
+    }
+    div[dataset-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        border-color: #58a6ff;
+    }
+    div[dataset-testid="stMetricLabel"] {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: #8b949e;
+    }
+    div[dataset-testid="stMetricValue"] {
+        font-size: 28px;
+        font-weight: 700;
+        color: #f0f6fc;
+    }
+
+    /* Status Banner */
+    .status-container {
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 25px;
+        text-align: center;
+        font-weight: 600;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+    .status-secure {
+        background: linear-gradient(90deg, rgba(35,134,54,0.15) 0%, rgba(35,134,54,0.05) 100%);
+        border: 1px solid #238636;
+        color: #3fb950;
+    }
+    .status-critical {
+        background: linear-gradient(90deg, rgba(218,54,51,0.25) 0%, rgba(218,54,51,0.1) 100%);
+        border: 1px solid #da3633;
+        color: #f85149;
+        animation: pulse-red 2s infinite;
+    }
+    
+    /* Animations */
+    @keyframes pulse-red {
+        0% { box-shadow: 0 0 0 0 rgba(218, 54, 51, 0.4); }
+        70% { box-shadow: 0 0 0 10px rgba(218, 54, 51, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(218, 54, 51, 0); }
+    }
+
+    /* Headers */
+    h1, h2, h3 {
+        color: #e6edf3 !important;
+        font-weight: 600;
+    }
+    .sub-header {
+        font-size: 14px;
+        color: #8b949e;
+        margin-bottom: 10px;
+    }
+
+    /* DataFrame / Tables */
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        overflow: hidden;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+STATE_FILE = "ids_state.json"
+LOG_FILE = "attack_log.csv"
+
+# -----------------------
+# DATA LOADING
+# -----------------------
+def read_state():
+    if not os.path.exists(STATE_FILE):
+        return {"total": 0, "attacks": 0, "status": "Normal"}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"total": 0, "attacks": 0, "status": "Normal"}
+
+def read_logs():
+    if not os.path.exists(LOG_FILE):
+        # Return empty with correct columns
+        return pd.DataFrame(columns=["timestamp", "attack_type", "severity", "confidence", "rate", "monitor_source"])
+    try:
+        df = pd.read_csv(LOG_FILE)
+        
+        # Backward Compatibility: Ensure all columns exist
+        required_columns = ["timestamp", "attack_type", "severity", "confidence", "rate", "monitor_source"]
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = "N/A" # Fill missing with default
+                
+        df = df.iloc[::-1] # Newest first
+        return df
+    except:
+        return pd.DataFrame(columns=["timestamp", "attack_type", "severity", "confidence", "rate", "monitor_source"])
+
+
+# -----------------------
+# SIDEBAR
+# -----------------------
+with st.sidebar:
+    st.markdown("### SecureNet Node-1")
+    st.markdown("---")
+    
+    # Status Indicator Widget
+    state = read_state()
+    # No icon for status
+    status_text = "NORMAL" if state["status"] == "Normal" else "AFFECTED"
+    
+    st.markdown(f"**System Status**: {status_text} - {state['status'].upper()}")
+    
+    st.markdown("### Detection Engine")
+    st.info("Hybrid AI Mode Active")
+    st.markdown("""
+    <div style='font-size: 12px; color: #8b949e;'>
+    <b>1. RANDOM FOREST</b> (Supervised)<br>
+    <i>Detects known attack patterns</i><br><br>
+    <b>2. ISOLATION FOREST</b> (Unsupervised)<br>
+    <i>Detects zero-day anomalies</i><br><br>
+    <b>3. TRAFFIC RULES</b> (Volumetric)<br>
+    <i>Detects DoS/Floods immediately</i>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### Configuration")
+    st.code("""
+Interface: en0
+Threshold: 20 r/s
+Model: RF + IF
+    """, language="yaml")
+    
+    st.divider()
+    st.caption("v3.0.0 Hybrid AI Build")
+    st.caption("Developed by Lakshitha Madushan")
+
+# -----------------------
+# MAIN LAYOUT
+# -----------------------
+
+# 1. Top Bar
+c1, c2 = st.columns([0.8, 4])
+with c1:
+    st.markdown("## SOC")
+with c2:
+    st.markdown("## Enterprise Threat Monitor")
+    st.markdown("<div class='sub-header'>Hybrid AI-Powered Network Intelligence System</div>", unsafe_allow_html=True)
+
+st.divider()
+
+state = read_state()
+logs = read_logs()
+
+# 2. Hero Status Banner
+if state["status"] == "ATTACK":
+    st.markdown("""
+        <div class="status-container status-critical">
+            SECURITY ALERT: ACTIVE INTRUSION DETECTED
+        </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+        <div class="status-container status-secure">
+            SYSTEM SECURE: HYBRID MONITORING ACTIVE
+        </div>
+    """, unsafe_allow_html=True)
+
+# 3. High-Level Metrics (KPIs)
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+
+with kpi1:
+    st.metric("Packets Analyzed", f"{state['total']:,}", delta="Live", delta_color="off")
+with kpi2:
+    st.metric("Threats Mitigated", state['attacks'], delta="Cumulative", delta_color="inverse")
+with kpi3:
+    peak = logs["rate"].max() if not logs.empty else 0
+    current_rate = logs.iloc[0]["rate"] if not logs.empty else 0
+    st.metric("Current Load", f"{current_rate:.1f} r/s", delta=f"Peak: {peak:.1f}")
+with kpi4:
+    # Most recent detection source
+    source = logs.iloc[0]["monitor_source"] if not logs.empty else "System"
+    st.metric("Active Logic", source, delta="Engine")
+
+st.markdown("---")
+
+# 4. Visualization & Alerts
+col_chart, col_table = st.columns([1.8, 1.2])
+
+with col_chart:
+    st.markdown("### Traffic Velocity Analysis")
+    if not logs.empty:
+        chart_data = logs.iloc[:50].iloc[::-1] # Last 50 points, chronological
+        
+        # Professional Area Chart
+        fig = px.area(
+            chart_data,
+            x="timestamp",
+            y="rate",
+            labels={"rate": "Packets / Sec", "timestamp": "Timeline"},
+            color_discrete_sequence=["#58a6ff"]
+        )
+        
+        # Style Chart to match SOC theme
+        fig.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#8b949e"),
+            margin=dict(l=20, r=20, t=10, b=20),
+            height=320,
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor="#30363d")
+        )
+        # Add red gradient for attacks
+        fig.update_traces(
+            line=dict(width=2),
+            fillcolor="rgba(88, 166, 255, 0.1)"
+        )
+        
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    else:
+        st.info("System initializing... waiting for traffic stream.")
+
+with col_table:
+    st.markdown("### Threat Ledger")
+    if not logs.empty:
+        # Fancy table Config
+        st.dataframe(
+            logs[["timestamp", "attack_type", "severity", "confidence", "monitor_source"]].head(8),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "timestamp": st.column_config.TextColumn("Time", width="medium"),
+                "attack_type": st.column_config.TextColumn("Signature", width="medium"),
+                "severity": st.column_config.TextColumn("Sev", width="small"),
+                "confidence": st.column_config.TextColumn("Conf", width="small"),
+                "monitor_source": st.column_config.TextColumn("Source", width="medium"),
+            }
+        )
+    else:
+        st.markdown("<div style='text-align: center; color: #8b949e; padding: 20px;'>No security incidents recorded.</div>", unsafe_allow_html=True)
+
+# 5. Footer
+st.markdown("---")
+f1, f2 = st.columns([1, 1])
+with f1:
+    st.markdown(f"<div style='color: #8b949e; font-size: 12px;'>System Uptime: {time.strftime('%H:%M:%S')} UTC</div>", unsafe_allow_html=True)
+with f2:
+    st.markdown("<div style='color: #8b949e; font-size: 12px; text-align: right;'>SecureNet AI v3.0 | Hybrid Architecture</div>", unsafe_allow_html=True)
+
+# Auto-Refresh
+time.sleep(1)
+st.rerun()
+
+---
+FILE 5: simulate_attack.py
+---
+import time
+import socket
+import sys
+import random
+from scapy.all import IP, TCP, Ether, sendp, get_if_hwaddr
+
+# CONFIGURATION
+INTERFACE = "en0"
+TARGET_PORT = 8080
+PACKET_COUNT = 100
+DELAY = 0.01  # 100 packets/sec roughly
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except:
+        return "127.0.0.1"
+
+def simulate_http_flood():
+    print(f"🚀 Starting HTTP Flood Simulation on {INTERFACE}...")
+    
+    try:
+        src_ip = get_local_ip()
+        dst_ip = "8.8.8.8" # Dummy destination that routes through en0
+        src_mac = get_if_hwaddr(INTERFACE)
+        dst_mac = "ff:ff:ff:ff:ff:ff" # Broadcast or Gateway MAC would be better, but broadcast ensures visibility
+        
+        print(f"📡 Sending from {src_ip} ({src_mac}) to {dst_ip}")
+        print(f"⚡ Target Rate: {1/DELAY:.0f} req/s")
+        
+        # Pre-build packet (Ethernet + IP + TCP)
+        # Using sendp (Layer 2) ensures it hits the interface regardless of routing table quirks for dummy IPs
+        pkt = Ether(src=src_mac, dst=dst_mac) / \
+              IP(src=src_ip, dst=dst_ip) / \
+              TCP(dport=TARGET_PORT, sport=random.randint(1024, 65535), flags="S")
+
+        count = 0
+        start = time.time()
+        
+        for _ in range(PACKET_COUNT):
+            sendp(pkt, iface=INTERFACE, verbose=0)
+            count += 1
+            if count % 20 == 0:
+                sys.stdout.write(f"\r💥 Sent {count} packets...")
+                sys.stdout.flush()
+            time.sleep(DELAY)
+            
+        duration = time.time() - start
+        print(f"\n✅ Finished. Sent {count} packets in {duration:.2f} seconds.")
+        print(f"📊 Actual Rate: {count/duration:.2f} packets/sec")
+        
+    except PermissionError:
+        print("\n❌ Permission denied: You must run this script with 'sudo'.")
+    except OSError as e:
+        print(f"\n❌ OS Error: {e}. Check if interface '{INTERFACE}' exists.")
+    except Exception as e:
+        print(f"\n❌ Unexpected Error: {e}")
+
+if __name__ == "__main__":
+    confirm = input(f"This will send {PACKET_COUNT} fake HTTP packets on {INTERFACE}. Type 'yes' to proceed: ")
+    if confirm.lower() == "yes":
+        simulate_http_flood()
+    else:
+        print("Cancelled.")
+
+---
+FILE 6: training/train_model.py
+---
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+import joblib
+
+# -----------------------------
+# 1. Load dataset
+# -----------------------------
+columns = [
+    "duration","protocol_type","service","flag","src_bytes","dst_bytes",
+    "land","wrong_fragment","urgent","hot","num_failed_logins","logged_in",
+    "num_compromised","root_shell","su_attempted","num_root",
+    "num_file_creations","num_shells","num_access_files","num_outbound_cmds",
+    "is_host_login","is_guest_login","count","srv_count","serror_rate",
+    "srv_serror_rate","rerror_rate","srv_rerror_rate","same_srv_rate",
+    "diff_srv_rate","srv_diff_host_rate","dst_host_count",
+    "dst_host_srv_count","dst_host_same_srv_rate","dst_host_diff_srv_rate",
+    "dst_host_same_src_port_rate","dst_host_srv_diff_host_rate",
+    "dst_host_serror_rate","dst_host_srv_serror_rate",
+    "dst_host_rerror_rate","dst_host_srv_rerror_rate",
+    "label","difficulty"
+]
+
+print("Loading dataset...")
+train_df = pd.read_csv("data/KDDTrain+.txt", names=columns)
+
+# -----------------------------
+# 2. Preprocessing
+# -----------------------------
+# Binary Classification Labeling
+train_df["label"] = train_df["label"].apply(
+    lambda x: "normal" if x == "normal" else "attack"
+)
+
+# Encoding Categorical Features
+encoder = LabelEncoder()
+for col in ["protocol_type", "service", "flag"]:
+    train_df[col] = encoder.fit_transform(train_df[col])
+
+# Feature Selection
+X = train_df.drop(["label", "difficulty"], axis=1)
+y = train_df["label"]
+
+# -----------------------------
+# 3. Train Random Forest (Supervised)
+# -----------------------------
+print("Training Random Forest (Supervised)...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+rf_model = RandomForestClassifier(
+    n_estimators=100,
+    random_state=42,
+    n_jobs=-1
+)
+rf_model.fit(X_train, y_train)
+
+# Evaluate RF
+y_pred_rf = rf_model.predict(X_test)
+print("RF Accuracy:", accuracy_score(y_test, y_pred_rf))
+
+# -----------------------------
+# 4. Train Isolation Forest (Unsupervised)
+# -----------------------------
+print("Training Isolation Forest (Unsupervised)...")
+# Isolate Normal Traffic for Training (Assumption: IF learns 'normality')
+normal_traffic = X[y == 'normal']
+
+iso_model = IsolationForest(
+    n_estimators=100, 
+    contamination=0.1, 
+    random_state=42,
+    n_jobs=-1
+)
+iso_model.fit(normal_traffic)
+
+# -----------------------------
+# 5. Save Models
+# -----------------------------
+joblib.dump(rf_model, "models/rf_ids_model.pkl")
+joblib.dump(iso_model, "models/iso_forest.pkl") # New Model
+print("✅ Models saved successfully: rf_ids_model.pkl, iso_forest.pkl")
+
+---
+FILE 7: realtime_packet_capture.py
+---
+from scapy.all import sniff
+
+def packet_handler(packet):
+    print(packet.summary())
+
+print("Starting live packet capture on en0... Press Ctrl+C to stop.")
+
+sniff(
+    iface="en0",     # Wi-Fi interface
+    prn=packet_handler,
+    store=False
+)
+
+--------------------------------------------------------------------------------
+PART 4: HOW TO RUN (SETUP INSTRUCTIONS)
+--------------------------------------------------------------------------------
+
+1.  **Prerequisites**:
+    - Install Python 3.
+    - Install dependencies: `pip install -r requirements.txt`
+    - (Optional) Download KDDTrain+.txt if you want to retrain.
+
+2.  **Training (Optional)**:
+    - Place `KDDTrain+.txt` in `data/`.
+    - Run: `python3 training/train_model.py`.
+
+3.  **Running the IDS**:
+    - Run: `sudo ./run_ids.sh`
+    - This will start:
+      - The Victim Server (Port 8080)
+      - The Backend Engine (scapy sniffer)
+      - The Frontend Dashboard (Streamlit)
+
+4.  **Testing**:
+    - Open local interface: http://localhost:8501
+    - Open another terminal and run `sudo python3 simulate_attack.py` to fire 
+      test packets.
+    - Observe the dashboard turn red and log the attack.
+
+================================================================================
+END OF MASTER GUIDE
+================================================================================

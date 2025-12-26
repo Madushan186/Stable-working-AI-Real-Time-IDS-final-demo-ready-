@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
@@ -24,53 +24,64 @@ columns = [
     "label","difficulty"
 ]
 
+print("Loading dataset...")
 train_df = pd.read_csv("data/KDDTrain+.txt", names=columns)
 
 # -----------------------------
-# 2. Binary classification
+# 2. Preprocessing
 # -----------------------------
+# Binary Classification Labeling
 train_df["label"] = train_df["label"].apply(
     lambda x: "normal" if x == "normal" else "attack"
 )
 
-# -----------------------------
-# 3. Encode categorical data
-# -----------------------------
+# Encoding Categorical Features
 encoder = LabelEncoder()
 for col in ["protocol_type", "service", "flag"]:
     train_df[col] = encoder.fit_transform(train_df[col])
 
-# -----------------------------
-# 4. Split features & labels
-# -----------------------------
+# Feature Selection
 X = train_df.drop(["label", "difficulty"], axis=1)
 y = train_df["label"]
 
+# -----------------------------
+# 3. Train Random Forest (Supervised)
+# -----------------------------
+print("Training Random Forest (Supervised)...")
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42
 )
 
-# -----------------------------
-# 5. Train model
-# -----------------------------
-model = RandomForestClassifier(
+rf_model = RandomForestClassifier(
     n_estimators=100,
     random_state=42,
     n_jobs=-1
 )
+rf_model.fit(X_train, y_train)
 
-model.fit(X_train, y_train)
-
-# -----------------------------
-# 6. Evaluate model
-# -----------------------------
-y_pred = model.predict(X_test)
-
-print("Accuracy:", accuracy_score(y_test, y_pred))
-print(classification_report(y_test, y_pred))
+# Evaluate RF
+y_pred_rf = rf_model.predict(X_test)
+print("RF Accuracy:", accuracy_score(y_test, y_pred_rf))
 
 # -----------------------------
-# 7. Save model
+# 4. Train Isolation Forest (Unsupervised)
 # -----------------------------
-joblib.dump(model, "models/rf_ids_model.pkl")
-print("Model saved successfully!")
+print("Training Isolation Forest (Unsupervised)...")
+# Isolate Normal Traffic for Training (Assumption: IF learns 'normality')
+normal_traffic = X[y == 'normal']
+
+iso_model = IsolationForest(
+    n_estimators=100, 
+    contamination=0.1, 
+    random_state=42,
+    n_jobs=-1
+)
+iso_model.fit(normal_traffic)
+
+# -----------------------------
+# 5. Save Models
+# -----------------------------
+joblib.dump(rf_model, "models/rf_ids_model.pkl")
+joblib.dump(iso_model, "models/iso_forest.pkl") # New Model
+print("✅ Models saved successfully: rf_ids_model.pkl, iso_forest.pkl")
+
